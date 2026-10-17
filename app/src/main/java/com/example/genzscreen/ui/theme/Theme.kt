@@ -32,7 +32,7 @@ private val LightColorScheme = lightColorScheme(
 fun GenZscreenTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = LightColorScheme,
-        typography = Typography, // Default Material 3 Typography
+        typography = androidx.compose.material3.Typography(), // Default Material 3 Typography
         content = content
     )
 }
