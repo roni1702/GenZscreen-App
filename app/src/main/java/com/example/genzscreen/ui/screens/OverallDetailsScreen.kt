@@ -175,7 +175,7 @@ fun SegmentedToggleButton(isActive: Boolean, leftText: String, rightText: String
 
 @Composable
 fun WeeklyBarChart(average: Float, offset: Int) {
-    val dashEffect = PathEffect.dashPath(floatArrayOf(10f, 10f), 0f)
+    val dashEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
     
     // In actual implementation, fetch last 7 days based on offset.
     // X-axis labels format: Day, Date Month (e.g., fri, 16 oct)
