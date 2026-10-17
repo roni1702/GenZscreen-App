@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">GenZscreen</string>
+    <string name="accessibility_description">This service is required to track video watching time and enforce your limits.</string>
+</resources>
