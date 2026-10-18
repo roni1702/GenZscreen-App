@@ -13,20 +13,54 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
+import com.example.genzscreen.data.GenZDatabase
 import com.example.genzscreen.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(navController: NavController) {
     var showBottomSheet by remember { mutableStateOf(false) }
 
-    // In a real app, this data comes from Room Database via ViewModel (Starts at 0)
-    val totalReelsToday = 0
-    val appUsageMap = emptyMap<String, Int>() // e.g. mapOf("Facebook" to 0)
+    // State for Real Data
+    var totalReelsToday by remember { mutableStateOf(0) }
+    var appUsageMap by remember { mutableStateOf(emptyMap<String, Int>()) }
+    val context = LocalContext.current
+
+    // Fetch Data from Database automatically
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            val db = GenZDatabase.getDatabase(context)
+            val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+            db.usageDao().getUsageForDate(date).collect { usageList ->
+                var total = 0
+                val map = mutableMapOf<String, Int>()
+                usageList.forEach {
+                    total += it.reelCount
+                    val appName = when(it.packageName) {
+                        "com.facebook.katana" -> "Facebook"
+                        "com.google.android.youtube" -> "YouTube"
+                        "com.instagram.android" -> "Instagram"
+                        "com.zhiliaoapp.musically" -> "TikTok"
+                        else -> "Unknown"
+                    }
+                    map[appName] = it.reelCount
+                }
+                withContext(Dispatchers.Main) {
+                    totalReelsToday = total
+                    appUsageMap = map
+                }
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -58,16 +92,15 @@ fun HomeScreen(navController: NavController) {
         ) {
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Clean Responsive Donut Chart
+            // Clean Responsive Donut Chart with Real Data
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .size(200.dp)
-                    .clickable { navController.navigate("details") } // Tapping center goes to Page 2
+                    .clickable { navController.navigate("details") }
             ) {
                 DonutChart(usageData = appUsageMap)
                 
-                // Center Text
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
                         text = "$totalReelsToday",
@@ -85,12 +118,9 @@ fun HomeScreen(navController: NavController) {
 
             Spacer(modifier = Modifier.height(48.dp))
 
-            // Set Limit Button
             Button(
                 onClick = { showBottomSheet = true },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
+                modifier = Modifier.fillMaxWidth().height(56.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
                 Text("Set limit for Reels & Videos", fontSize = 16.sp)
@@ -98,15 +128,9 @@ fun HomeScreen(navController: NavController) {
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Active Limits Summary (Clean UI)
-            Text(
-                text = "Active Limits",
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.fillMaxWidth()
-            )
+            Text("Active Limits", fontWeight = FontWeight.Bold, modifier = Modifier.fillMaxWidth())
             Spacer(modifier = Modifier.height(8.dp))
             
-            // Empty State (Because no limits are set initially)
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -122,7 +146,6 @@ fun HomeScreen(navController: NavController) {
             }
         }
 
-        // Bottom Sheet for Apps List
         if (showBottomSheet) {
             ModalBottomSheet(
                 onDismissRequest = { showBottomSheet = false },
@@ -142,7 +165,7 @@ fun HomeScreen(navController: NavController) {
                             headlineContent = { Text(appName) },
                             modifier = Modifier.clickable {
                                 showBottomSheet = false
-                                navController.navigate("app_details/$appName") // Navigates to Page 3
+                                navController.navigate("app_details/$appName")
                             }
                         )
                         Divider(color = MaterialTheme.colorScheme.surfaceVariant)
@@ -155,7 +178,7 @@ fun HomeScreen(navController: NavController) {
 
 @Composable
 fun DonutChart(usageData: Map<String, Int>) {
-    val total = usageData.values.sum().coerceAtLeast(1) // Prevent division by zero
+    val total = usageData.values.sum().coerceAtLeast(1)
     
     val colors = mapOf(
         "Facebook" to FacebookColor,
@@ -168,13 +191,10 @@ fun DonutChart(usageData: Map<String, Int>) {
         val strokeWidth = 40f
         
         if (usageData.isEmpty() || usageData.values.all { it == 0 }) {
-            // Empty State: Draw a simple grey circle
             drawArc(
                 color = BorderLight,
-                startAngle = 0f,
-                sweepAngle = 360f,
-                useCenter = false,
-                style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+                startAngle = 0f, sweepAngle = 360f,
+                useCenter = false, style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
             )
         } else {
             var startAngle = -90f
@@ -183,10 +203,8 @@ fun DonutChart(usageData: Map<String, Int>) {
                     val sweepAngle = (count.toFloat() / total) * 360f
                     drawArc(
                         color = colors[app] ?: Color.Gray,
-                        startAngle = startAngle,
-                        sweepAngle = sweepAngle,
-                        useCenter = false,
-                        style = Stroke(width = strokeWidth, cap = StrokeCap.Butt)
+                        startAngle = startAngle, sweepAngle = sweepAngle,
+                        useCenter = false, style = Stroke(width = strokeWidth, cap = StrokeCap.Butt)
                     )
                     startAngle += sweepAngle
                 }
