@@ -3,6 +3,9 @@ package com.example.genzscreen.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.example.genzscreen.data.DailyUsage
+import com.example.genzscreen.data.GenZDatabase
 import kotlinx.coroutines.*
 import java.text.SimpleDateFormat
 import java.util.*
@@ -12,21 +15,23 @@ class ReelAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private lateinit var overlayManager: OverlayManager
     
-    // Usage Tracking Variables
     private var currentPackage = ""
-    private var sessionStartTime = 0L
     private var isWatching = false
-    
     private var videoStartTime = 0L
     private var currentReelCount = 0
     private var accumulatedTimeMillis = 0L
 
     private var trackingJob: Job? = null
+    private var stopJob: Job? = null
+
+    // Video Detection Throttle
+    private var lastCheckTime = 0L
+    private var lastVideoResult = false
 
     override fun onServiceConnected() {
         overlayManager = OverlayManager(this)
         val info = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or AccessibilityEvent.TYPE_VIEW_SCROLLED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.DEFAULT
             packageNames = arrayOf(
@@ -44,47 +49,83 @@ class ReelAccessibilityService : AccessibilityService() {
 
         if (packageName != currentPackage) {
             currentPackage = packageName
-            resetTracking()
+            fetchTodayCountFromDB() // Load real data for today
         }
 
-        // Logic to detect if it's a video/reel screen (Heuristic logic)
-        // For production, we track specific class names like ViewPager2 or RecyclerViews
-        val isVideoScreen = detectVideoScreen(event)
+        // Check if video is actually on screen
+        val hasVideo = checkVideoThrottled(rootInActiveWindow)
 
-        if (isVideoScreen && !isWatching) {
-            startWatchingSession()
-        } else if (!isVideoScreen && isWatching) {
-            stopWatchingSession()
+        if (hasVideo) {
+            stopJob?.cancel() // Cancel hiding if video is found
+            
+            if (!isWatching) {
+                startWatchingSession()
+            }
+
+            // Detect Reel Scroll
+            if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+                val timeSpent = System.currentTimeMillis() - videoStartTime
+                if (timeSpent >= 5000L) { // Only count if watched for 5 seconds
+                    currentReelCount++
+                    saveUsageToDatabaseIncremental(currentPackage, 1, 0L)
+                }
+                videoStartTime = System.currentTimeMillis()
+            }
+        } else {
+            // Give 3 seconds buffer before hiding the box
+            if (isWatching && stopJob?.isActive != true) {
+                stopJob = serviceScope.launch {
+                    delay(3000)
+                    stopWatchingSession()
+                }
+            }
         }
     }
 
-    private fun detectVideoScreen(event: AccessibilityEvent): Boolean {
-        // Simplified detection. If it's one of the target apps and actively scrolling/changing content.
-        val className = event.className?.toString() ?: ""
-        return className.contains("ViewPager") || className.contains("RecyclerView")
+    // Smart Video Detector
+    private fun checkVideoThrottled(node: AccessibilityNodeInfo?): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastCheckTime < 1000L) return lastVideoResult // Throttle check to avoid lag
+        lastCheckTime = now
+        lastVideoResult = isVideoOnScreen(node)
+        return lastVideoResult
+    }
+
+    private fun isVideoOnScreen(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
+        val queue = LinkedList<AccessibilityNodeInfo>()
+        queue.add(node)
+        
+        while (queue.isNotEmpty()) {
+            val current = queue.poll() ?: continue
+            val className = current.className?.toString() ?: ""
+            
+            // TextureView and SurfaceView are native Android video players
+            if (className.contains("SurfaceView") || className.contains("TextureView") || className.contains("VideoView")) {
+                return true
+            }
+            for (i in 0 until current.childCount) {
+                current.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return false
     }
 
     private fun startWatchingSession() {
         isWatching = true
         videoStartTime = System.currentTimeMillis()
-        if (sessionStartTime == 0L) sessionStartTime = System.currentTimeMillis()
 
         trackingJob?.cancel()
         trackingJob = serviceScope.launch {
             while (isActive) {
-                delay(1000) // 1 second tick
+                delay(1000) // 1 sec tick
                 accumulatedTimeMillis += 1000
                 
-                // Check 5-second rule
-                val timeOnCurrentVideo = System.currentTimeMillis() - videoStartTime
-                if (timeOnCurrentVideo == 5000L) {
-                    currentReelCount++ // Increment count ONLY after 5 seconds of play
+                // Save time to DB every 5 seconds to prevent data loss
+                if (accumulatedTimeMillis % 5000L == 0L) {
+                    saveUsageToDatabaseIncremental(currentPackage, 0, 5000L)
                 }
 
-                // Check Limits & Breaks
-                checkLimitsAndBreaks()
-
-                // Update UI Overlay
                 val timeStr = formatTime(accumulatedTimeMillis)
                 withContext(Dispatchers.Main) {
                     overlayManager.showTrackingOverlay(currentReelCount, timeStr)
@@ -97,54 +138,47 @@ class ReelAccessibilityService : AccessibilityService() {
         isWatching = false
         trackingJob?.cancel()
         
-        // Save to Database (Room)
-        saveUsageToDatabase()
-
-        // Hide overlay after 5 seconds of exit as per requirements
-        serviceScope.launch {
-            delay(5000)
-            withContext(Dispatchers.Main) {
-                overlayManager.hideTrackingOverlay()
-                overlayManager.hideFacebookBlocker()
-            }
+        serviceScope.launch(Dispatchers.Main) {
+            overlayManager.hideTrackingOverlay()
         }
     }
 
-    private suspend fun checkLimitsAndBreaks() {
-        // Here we query the GenZDatabase (Room) for configured limits
-        // val limit = db.usageDao().getLimitForApp(currentPackage)
+    // Save Data to Room Database without crushing old data
+    private fun saveUsageToDatabaseIncremental(pkg: String, countAdd: Int, timeAdd: Long) {
+        if (countAdd == 0 && timeAdd == 0L) return
+        val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         
-        // Pseudo logic for limit enforcement
-        val limitReached = false // Replace with actual DB check
-
-        if (limitReached) {
-            withContext(Dispatchers.Main) {
-                if (currentPackage == "com.facebook.katana") {
-                    overlayManager.showFacebookBlocker()
-                } else {
-                    // Force kill / prevent entry for YT, TikTok, Insta
-                    performGlobalAction(GLOBAL_ACTION_HOME)
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                val db = GenZDatabase.getDatabase(applicationContext)
+                val cursor = db.query("SELECT * FROM daily_usage WHERE date = '$date' AND packageName = '$pkg'", null)
+                val exists = cursor.moveToFirst()
+                cursor.close()
+                
+                if (!exists) {
+                    db.usageDao().insertUsage(DailyUsage(date, pkg, 0, 0L))
                 }
-            }
-        }
-
-        // 30 Min Break Alerts
-        val sessionTime = System.currentTimeMillis() - sessionStartTime
-        val thirtyMins = 30 * 60 * 1000L
-        if (sessionTime > 0 && sessionTime % thirtyMins in 0..1500L) {
-            // Trigger 30-min dialog logic here
-            // performGlobalAction(GLOBAL_ACTION_HOME) to force break
+                db.usageDao().updateUsage(date, pkg, countAdd, timeAdd)
+            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
-    private fun saveUsageToDatabase() {
-        // val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-        // db.usageDao().updateUsage(today, currentPackage, currentReelCount, accumulatedTimeMillis)
-    }
-
-    private fun resetTracking() {
-        videoStartTime = 0L
-        isWatching = false
+    private fun fetchTodayCountFromDB() {
+        val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                val db = GenZDatabase.getDatabase(applicationContext)
+                val cursor = db.query("SELECT reelCount, watchTimeMillis FROM daily_usage WHERE date = '$date' AND packageName = '$currentPackage'", null)
+                if (cursor.moveToFirst()) {
+                    currentReelCount = cursor.getInt(0)
+                    accumulatedTimeMillis = cursor.getLong(1)
+                } else {
+                    currentReelCount = 0
+                    accumulatedTimeMillis = 0L
+                }
+                cursor.close()
+            } catch (e: Exception) {}
+        }
     }
 
     private fun formatTime(millis: Long): String {
