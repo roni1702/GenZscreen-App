@@ -21,23 +21,26 @@ class ReelAccessibilityService : AccessibilityService() {
     private var videoStartTime = 0L
     private var currentReelCount = 0
     private var accumulatedTimeMillis = 0L
+    private var continuousSessionMillis = 0L // একটানা দেখার হিসাব
+
+    // লিমিট ভেরিয়েবল
+    private var dailyReelLimit: Int? = null
+    private var dailyTimeLimitMillis: Long? = null
 
     private var trackingJob: Job? = null
     private var stopJob: Job? = null
+    private var isBreakAlertShowing = false
 
     private val targetPackages = listOf(
-        "com.facebook.katana",
-        "com.google.android.youtube",
-        "com.zhiliaoapp.musically",
-        "com.instagram.android"
+        "com.facebook.katana", "com.google.android.youtube",
+        "com.zhiliaoapp.musically", "com.instagram.android"
     )
 
     override fun onServiceConnected() {
         overlayManager = OverlayManager(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        
         val info = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or AccessibilityEvent.TYPE_VIEW_SCROLLED
+            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_VIEW_SCROLLED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.DEFAULT
             packageNames = targetPackages.toTypedArray()
@@ -48,7 +51,6 @@ class ReelAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val packageName = event?.packageName?.toString() ?: return
 
-        // অন্য অ্যাপে গেলে বক্স বন্ধ করে দিবে
         if (!targetPackages.contains(packageName)) {
             if (isWatching) stopWatchingSession()
             currentPackage = ""
@@ -57,32 +59,30 @@ class ReelAccessibilityService : AccessibilityService() {
 
         if (packageName != currentPackage) {
             currentPackage = packageName
-            fetchTodayCountFromDB()
+            fetchTodayDataAndLimitsFromDB() // ডেটার সাথে লিমিটও লোড হবে
+            serviceScope.launch(Dispatchers.Main) { overlayManager.hideFacebookBlocker() }
         }
 
-        // 🚀 স্মার্ট ডিটেকশন (বিনা ল্যাগে): অডিও বাজছে কিনা বা স্ক্রল হচ্ছে কিনা
         val isAudioPlaying = audioManager.isMusicActive
         val isScroll = event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
         
-        // ফেসবুক/ইউটিউবে অডিও বাজলে বা স্ক্রল করলেই আমরা ধরে নিব ভিডিও/রিলস চলছে
         if (isAudioPlaying || isScroll) {
-            stopJob?.cancel() // বক্স গায়েবের টাইমার বাতিল
+            stopJob?.cancel()
             
             if (!isWatching) {
                 startWatchingSession()
             }
 
-            // রিলস স্ক্রল করলে কাউন্ট বাড়ানো
             if (isScroll) {
                 val timeSpent = System.currentTimeMillis() - videoStartTime
-                if (timeSpent >= 3000L) { // ৩ সেকেন্ড দেখলে তবেই ১টি রিলস কাউন্ট হবে
+                if (timeSpent >= 5000L) { // ৫ সেকেন্ড লজিক
                     currentReelCount++
                     saveUsageToDatabaseIncremental(currentPackage, 1, 0L)
-                    videoStartTime = System.currentTimeMillis() // সময় রিসেট
+                    checkLimits() // রিলস বাড়লেই লিমিট চেক হবে
+                    videoStartTime = System.currentTimeMillis()
                 }
             }
         } else {
-            // ভিডিও বন্ধ হলে সাথে সাথে বক্স না লুকিয়ে ৪ সেকেন্ড বাফার দেওয়া
             if (isWatching && stopJob?.isActive != true) {
                 stopJob = serviceScope.launch {
                     delay(4000)
@@ -99,17 +99,40 @@ class ReelAccessibilityService : AccessibilityService() {
         trackingJob?.cancel()
         trackingJob = serviceScope.launch {
             while (isActive) {
-                delay(1000) // প্রতি সেকেন্ডে কাউন্ট বাড়বে
+                delay(1000)
                 accumulatedTimeMillis += 1000
+                continuousSessionMillis += 1000 // একটানা সেশন কাউন্ট
                 
-                // ডেটা লস এড়াতে প্রতি ৫ সেকেন্ডে ডাটাবেজে সেভ
                 if (accumulatedTimeMillis % 5000L == 0L) {
                     saveUsageToDatabaseIncremental(currentPackage, 0, 5000L)
+                    checkLimits() // প্রতি ৫ সেকেন্ডে লিমিট চেক
+                }
+
+                // ৩০ মিনিটের ব্রেক অ্যালার্ট লজিক
+                val thirtyMins = 30 * 60 * 1000L
+                if (continuousSessionMillis > 0 && continuousSessionMillis % thirtyMins == 0L && !isBreakAlertShowing) {
+                    isBreakAlertShowing = true
+                    withContext(Dispatchers.Main) {
+                        overlayManager.showBreakAlert(
+                            minutes = (continuousSessionMillis / 60000).toInt(),
+                            onTakeRest = {
+                                isBreakAlertShowing = false
+                                overlayManager.hideBreakAlert()
+                                performGlobalAction(GLOBAL_ACTION_HOME) // হোম স্ক্রিনে নিয়ে যাবে
+                            },
+                            onNoThanks = {
+                                isBreakAlertShowing = false
+                                overlayManager.hideBreakAlert()
+                            }
+                        )
+                    }
                 }
 
                 val timeStr = formatTime(accumulatedTimeMillis)
                 withContext(Dispatchers.Main) {
-                    overlayManager.showTrackingOverlay(currentReelCount, timeStr)
+                    if (!isBreakAlertShowing) {
+                        overlayManager.showTrackingOverlay(currentReelCount, timeStr)
+                    }
                 }
             }
         }
@@ -118,51 +141,71 @@ class ReelAccessibilityService : AccessibilityService() {
     private fun stopWatchingSession() {
         isWatching = false
         trackingJob?.cancel()
-        
+        continuousSessionMillis = 0L // অ্যাপ থেকে বের হলে একটানা সময় রিসেট
         serviceScope.launch(Dispatchers.Main) {
             overlayManager.hideTrackingOverlay()
         }
     }
 
-    // নিখুঁতভাবে ডেটা সেভ করার সেফ মেথড (কোনো ক্র্যাশ হবে না)
+    // লিমিট চেক করার ফাংশন
+    private fun checkLimits() {
+        var isLimitReached = false
+        dailyReelLimit?.let { if (currentReelCount >= it) isLimitReached = true }
+        dailyTimeLimitMillis?.let { if (accumulatedTimeMillis >= it) isLimitReached = true }
+
+        if (isLimitReached) {
+            if (currentPackage == "com.facebook.katana") {
+                serviceScope.launch(Dispatchers.Main) { overlayManager.showFacebookBlocker() }
+            } else {
+                performGlobalAction(GLOBAL_ACTION_HOME) // YouTube, TikTok, Insta ফোর্স ক্লোজ
+            }
+        }
+    }
+
     private fun saveUsageToDatabaseIncremental(pkg: String, countAdd: Int, timeAdd: Long) {
         if (countAdd == 0 && timeAdd == 0L) return
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-        
         serviceScope.launch(Dispatchers.IO) {
             try {
                 val db = GenZDatabase.getDatabase(applicationContext).openHelper.writableDatabase
                 val cursor = db.query("SELECT * FROM daily_usage WHERE date = ? AND packageName = ?", arrayOf(date, pkg))
                 val exists = cursor.moveToFirst()
                 cursor.close()
-                
                 if (!exists) {
                     db.execSQL("INSERT INTO daily_usage (date, packageName, reelCount, watchTimeMillis) VALUES (?, ?, 0, 0)", arrayOf(date, pkg))
                 }
                 db.execSQL("UPDATE daily_usage SET reelCount = reelCount + ?, watchTimeMillis = watchTimeMillis + ? WHERE date = ? AND packageName = ?", arrayOf(countAdd, timeAdd, date, pkg))
-            } catch (e: Exception) { 
-                e.printStackTrace() 
-            }
+            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
-    private fun fetchTodayCountFromDB() {
+    // ডেটাবেজ থেকে রিলস, টাইম এবং লিমিট একসাথে লোড করা
+    private fun fetchTodayDataAndLimitsFromDB() {
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         serviceScope.launch(Dispatchers.IO) {
             try {
                 val db = GenZDatabase.getDatabase(applicationContext).openHelper.readableDatabase
+                
+                // ১. ইউসেজ ডেটা আনা
                 val cursor = db.query("SELECT reelCount, watchTimeMillis FROM daily_usage WHERE date = ? AND packageName = ?", arrayOf(date, currentPackage))
                 if (cursor.moveToFirst()) {
                     currentReelCount = cursor.getInt(0)
                     accumulatedTimeMillis = cursor.getLong(1)
                 } else {
-                    currentReelCount = 0
-                    accumulatedTimeMillis = 0L
+                    currentReelCount = 0; accumulatedTimeMillis = 0L
                 }
                 cursor.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+
+                // ২. লিমিট আনা
+                val limitCursor = db.query("SELECT maxReels, maxTimeMillis FROM app_limits WHERE packageName = ?", arrayOf(currentPackage))
+                if (limitCursor.moveToFirst()) {
+                    dailyReelLimit = if (limitCursor.isNull(0)) null else limitCursor.getInt(0)
+                    dailyTimeLimitMillis = if (limitCursor.isNull(1)) null else limitCursor.getLong(1)
+                } else {
+                    dailyReelLimit = null; dailyTimeLimitMillis = null
+                }
+                limitCursor.close()
+            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
