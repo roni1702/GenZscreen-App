@@ -24,9 +24,12 @@ class ReelAccessibilityService : AccessibilityService() {
     private var trackingJob: Job? = null
     private var stopJob: Job? = null
 
-    // Video Detection Throttle
-    private var lastCheckTime = 0L
-    private var lastVideoResult = false
+    private val targetPackages = listOf(
+        "com.facebook.katana",
+        "com.google.android.youtube",
+        "com.zhiliaoapp.musically",
+        "com.instagram.android"
+    )
 
     override fun onServiceConnected() {
         overlayManager = OverlayManager(this)
@@ -34,12 +37,7 @@ class ReelAccessibilityService : AccessibilityService() {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or AccessibilityEvent.TYPE_VIEW_SCROLLED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.DEFAULT
-            packageNames = arrayOf(
-                "com.facebook.katana",
-                "com.google.android.youtube",
-                "com.zhiliaoapp.musically",
-                "com.instagram.android"
-            )
+            packageNames = targetPackages.toTypedArray()
         }
         this.serviceInfo = info
     }
@@ -47,48 +45,46 @@ class ReelAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val packageName = event?.packageName?.toString() ?: return
 
-        if (packageName != currentPackage) {
-            currentPackage = packageName
-            fetchTodayCountFromDB() // Load real data for today
+        // অন্য কোনো অ্যাপে চলে গেলে বক্স বন্ধ করে দেওয়া
+        if (!targetPackages.contains(packageName)) {
+            if (isWatching) stopWatchingSession()
+            return
         }
 
-        // Check if video is actually on screen
-        val hasVideo = checkVideoThrottled(rootInActiveWindow)
+        // টার্গেট অ্যাপগুলোর মধ্যে সুইচ করলে ডেটা লোড করা
+        if (packageName != currentPackage) {
+            currentPackage = packageName
+            fetchTodayCountFromDB()
+        }
+
+        // স্ক্রিনে ভিডিও আছে কিনা চেক করা (Smart Detection)
+        val hasVideo = isVideoOnScreen(rootInActiveWindow)
 
         if (hasVideo) {
-            stopJob?.cancel() // Cancel hiding if video is found
+            stopJob?.cancel() // বক্স গায়েব হওয়ার টাইমার বাতিল করা
             
             if (!isWatching) {
                 startWatchingSession()
             }
 
-            // Detect Reel Scroll
+            // রিলস স্ক্রল ডিটেক্ট করা
             if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
                 val timeSpent = System.currentTimeMillis() - videoStartTime
-                if (timeSpent >= 5000L) { // Only count if watched for 5 seconds
+                if (timeSpent >= 3000L) { // কমপক্ষে ৩ সেকেন্ড দেখলে তবেই কাউন্ট হবে
                     currentReelCount++
                     saveUsageToDatabaseIncremental(currentPackage, 1, 0L)
                 }
                 videoStartTime = System.currentTimeMillis()
             }
         } else {
-            // Give 3 seconds buffer before hiding the box
+            // ভিডিও স্ক্রিন থেকে বের হলে সাথে সাথে বক্স গায়েব না করে ৫ সেকেন্ড অপেক্ষা করা (Buffer)
             if (isWatching && stopJob?.isActive != true) {
                 stopJob = serviceScope.launch {
-                    delay(3000)
+                    delay(5000)
                     stopWatchingSession()
                 }
             }
         }
-    }
-
-    // Smart Video Detector
-    private fun checkVideoThrottled(node: AccessibilityNodeInfo?): Boolean {
-        val now = System.currentTimeMillis()
-        if (now - lastCheckTime < 1000L) return lastVideoResult // Throttle check to avoid lag
-        lastCheckTime = now
-        lastVideoResult = isVideoOnScreen(node)
-        return lastVideoResult
     }
 
     private fun isVideoOnScreen(node: AccessibilityNodeInfo?): Boolean {
@@ -99,11 +95,23 @@ class ReelAccessibilityService : AccessibilityService() {
         while (queue.isNotEmpty()) {
             val current = queue.poll() ?: continue
             val className = current.className?.toString() ?: ""
+            val viewId = current.viewIdResourceName?.lowercase() ?: ""
+            val contentDesc = current.contentDescription?.toString()?.lowercase() ?: ""
             
-            // TextureView and SurfaceView are native Android video players
-            if (className.contains("SurfaceView") || className.contains("TextureView") || className.contains("VideoView")) {
+            // ফেসবুক, ইউটিউব, টিকটক, ইনস্টাগ্রামের ভিডিও ডিটেকশন
+            if (className.contains("SurfaceView") || 
+                className.contains("TextureView") || 
+                className.contains("VideoView") ||
+                className.contains("LithoView") || // Facebook এর জন্য
+                viewId.contains("video") ||
+                viewId.contains("reel") ||
+                viewId.contains("player") ||
+                viewId.contains("shorts") ||
+                contentDesc.contains("video") ||
+                contentDesc.contains("reel")) {
                 return true
             }
+            
             for (i in 0 until current.childCount) {
                 current.getChild(i)?.let { queue.add(it) }
             }
@@ -118,10 +126,10 @@ class ReelAccessibilityService : AccessibilityService() {
         trackingJob?.cancel()
         trackingJob = serviceScope.launch {
             while (isActive) {
-                delay(1000) // 1 sec tick
+                delay(1000) // প্রতি সেকেন্ডে কাউন্ট বাড়বে
                 accumulatedTimeMillis += 1000
                 
-                // Save time to DB every 5 seconds to prevent data loss
+                // ডেটা লস এড়াতে প্রতি ৫ সেকেন্ড পরপর ডাটাবেজে সেভ হবে
                 if (accumulatedTimeMillis % 5000L == 0L) {
                     saveUsageToDatabaseIncremental(currentPackage, 0, 5000L)
                 }
@@ -143,7 +151,6 @@ class ReelAccessibilityService : AccessibilityService() {
         }
     }
 
-    // Save Data to Room Database without crushing old data
     private fun saveUsageToDatabaseIncremental(pkg: String, countAdd: Int, timeAdd: Long) {
         if (countAdd == 0 && timeAdd == 0L) return
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
@@ -151,7 +158,7 @@ class ReelAccessibilityService : AccessibilityService() {
         serviceScope.launch(Dispatchers.IO) {
             try {
                 val db = GenZDatabase.getDatabase(applicationContext)
-                val cursor = db.query("SELECT * FROM daily_usage WHERE date = '$date' AND packageName = '$pkg'", null)
+                val cursor = db.query("SELECT * FROM daily_usage WHERE date = ? AND packageName = ?", arrayOf(date, pkg))
                 val exists = cursor.moveToFirst()
                 cursor.close()
                 
@@ -159,7 +166,9 @@ class ReelAccessibilityService : AccessibilityService() {
                     db.usageDao().insertUsage(DailyUsage(date, pkg, 0, 0L))
                 }
                 db.usageDao().updateUsage(date, pkg, countAdd, timeAdd)
-            } catch (e: Exception) { e.printStackTrace() }
+            } catch (e: Exception) { 
+                e.printStackTrace() 
+            }
         }
     }
 
@@ -168,7 +177,7 @@ class ReelAccessibilityService : AccessibilityService() {
         serviceScope.launch(Dispatchers.IO) {
             try {
                 val db = GenZDatabase.getDatabase(applicationContext)
-                val cursor = db.query("SELECT reelCount, watchTimeMillis FROM daily_usage WHERE date = '$date' AND packageName = '$currentPackage'", null)
+                val cursor = db.query("SELECT reelCount, watchTimeMillis FROM daily_usage WHERE date = ? AND packageName = ?", arrayOf(date, currentPackage))
                 if (cursor.moveToFirst()) {
                     currentReelCount = cursor.getInt(0)
                     accumulatedTimeMillis = cursor.getLong(1)
@@ -177,7 +186,9 @@ class ReelAccessibilityService : AccessibilityService() {
                     accumulatedTimeMillis = 0L
                 }
                 cursor.close()
-            } catch (e: Exception) {}
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 
