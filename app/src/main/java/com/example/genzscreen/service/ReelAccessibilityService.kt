@@ -2,9 +2,9 @@ package com.example.genzscreen.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.Context
+import android.media.AudioManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
-import com.example.genzscreen.data.DailyUsage
 import com.example.genzscreen.data.GenZDatabase
 import kotlinx.coroutines.*
 import java.text.SimpleDateFormat
@@ -14,6 +14,7 @@ class ReelAccessibilityService : AccessibilityService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private lateinit var overlayManager: OverlayManager
+    private lateinit var audioManager: AudioManager
     
     private var currentPackage = ""
     private var isWatching = false
@@ -33,6 +34,8 @@ class ReelAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         overlayManager = OverlayManager(this)
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        
         val info = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or AccessibilityEvent.TYPE_VIEW_SCROLLED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
@@ -45,78 +48,48 @@ class ReelAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val packageName = event?.packageName?.toString() ?: return
 
-        // অন্য কোনো অ্যাপে চলে গেলে বক্স বন্ধ করে দেওয়া
+        // অন্য অ্যাপে গেলে বক্স বন্ধ করে দিবে
         if (!targetPackages.contains(packageName)) {
             if (isWatching) stopWatchingSession()
+            currentPackage = ""
             return
         }
 
-        // টার্গেট অ্যাপগুলোর মধ্যে সুইচ করলে ডেটা লোড করা
         if (packageName != currentPackage) {
             currentPackage = packageName
             fetchTodayCountFromDB()
         }
 
-        // স্ক্রিনে ভিডিও আছে কিনা চেক করা (Smart Detection)
-        val hasVideo = isVideoOnScreen(rootInActiveWindow)
-
-        if (hasVideo) {
-            stopJob?.cancel() // বক্স গায়েব হওয়ার টাইমার বাতিল করা
+        // 🚀 স্মার্ট ডিটেকশন (বিনা ল্যাগে): অডিও বাজছে কিনা বা স্ক্রল হচ্ছে কিনা
+        val isAudioPlaying = audioManager.isMusicActive
+        val isScroll = event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
+        
+        // ফেসবুক/ইউটিউবে অডিও বাজলে বা স্ক্রল করলেই আমরা ধরে নিব ভিডিও/রিলস চলছে
+        if (isAudioPlaying || isScroll) {
+            stopJob?.cancel() // বক্স গায়েবের টাইমার বাতিল
             
             if (!isWatching) {
                 startWatchingSession()
             }
 
-            // রিলস স্ক্রল ডিটেক্ট করা
-            if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            // রিলস স্ক্রল করলে কাউন্ট বাড়ানো
+            if (isScroll) {
                 val timeSpent = System.currentTimeMillis() - videoStartTime
-                if (timeSpent >= 3000L) { // কমপক্ষে ৩ সেকেন্ড দেখলে তবেই কাউন্ট হবে
+                if (timeSpent >= 3000L) { // ৩ সেকেন্ড দেখলে তবেই ১টি রিলস কাউন্ট হবে
                     currentReelCount++
                     saveUsageToDatabaseIncremental(currentPackage, 1, 0L)
+                    videoStartTime = System.currentTimeMillis() // সময় রিসেট
                 }
-                videoStartTime = System.currentTimeMillis()
             }
         } else {
-            // ভিডিও স্ক্রিন থেকে বের হলে সাথে সাথে বক্স গায়েব না করে ৫ সেকেন্ড অপেক্ষা করা (Buffer)
+            // ভিডিও বন্ধ হলে সাথে সাথে বক্স না লুকিয়ে ৪ সেকেন্ড বাফার দেওয়া
             if (isWatching && stopJob?.isActive != true) {
                 stopJob = serviceScope.launch {
-                    delay(5000)
+                    delay(4000)
                     stopWatchingSession()
                 }
             }
         }
-    }
-
-    private fun isVideoOnScreen(node: AccessibilityNodeInfo?): Boolean {
-        if (node == null) return false
-        val queue = LinkedList<AccessibilityNodeInfo>()
-        queue.add(node)
-        
-        while (queue.isNotEmpty()) {
-            val current = queue.poll() ?: continue
-            val className = current.className?.toString() ?: ""
-            val viewId = current.viewIdResourceName?.lowercase() ?: ""
-            val contentDesc = current.contentDescription?.toString()?.lowercase() ?: ""
-            
-            // ফেসবুক, ইউটিউব, টিকটক, ইনস্টাগ্রামের ভিডিও ডিটেকশন
-            if (className.contains("SurfaceView") || 
-                className.contains("TextureView") || 
-                className.contains("VideoView") ||
-                className.contains("LithoView") || // Facebook এর জন্য
-                viewId.contains("video") ||
-                viewId.contains("reel") ||
-                viewId.contains("player") ||
-                viewId.contains("shorts") ||
-                contentDesc.contains("video") ||
-                contentDesc.contains("reel")) {
-                return true
-            }
-            
-            for (i in 0 until current.childCount) {
-                current.getChild(i)?.let { queue.add(it) }
-            }
-        }
-        return false
     }
 
     private fun startWatchingSession() {
@@ -129,7 +102,7 @@ class ReelAccessibilityService : AccessibilityService() {
                 delay(1000) // প্রতি সেকেন্ডে কাউন্ট বাড়বে
                 accumulatedTimeMillis += 1000
                 
-                // ডেটা লস এড়াতে প্রতি ৫ সেকেন্ড পরপর ডাটাবেজে সেভ হবে
+                // ডেটা লস এড়াতে প্রতি ৫ সেকেন্ডে ডাটাবেজে সেভ
                 if (accumulatedTimeMillis % 5000L == 0L) {
                     saveUsageToDatabaseIncremental(currentPackage, 0, 5000L)
                 }
@@ -151,21 +124,22 @@ class ReelAccessibilityService : AccessibilityService() {
         }
     }
 
+    // নিখুঁতভাবে ডেটা সেভ করার সেফ মেথড (কোনো ক্র্যাশ হবে না)
     private fun saveUsageToDatabaseIncremental(pkg: String, countAdd: Int, timeAdd: Long) {
         if (countAdd == 0 && timeAdd == 0L) return
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         
         serviceScope.launch(Dispatchers.IO) {
             try {
-                val db = GenZDatabase.getDatabase(applicationContext)
+                val db = GenZDatabase.getDatabase(applicationContext).openHelper.writableDatabase
                 val cursor = db.query("SELECT * FROM daily_usage WHERE date = ? AND packageName = ?", arrayOf(date, pkg))
                 val exists = cursor.moveToFirst()
                 cursor.close()
                 
                 if (!exists) {
-                    db.usageDao().insertUsage(DailyUsage(date, pkg, 0, 0L))
+                    db.execSQL("INSERT INTO daily_usage (date, packageName, reelCount, watchTimeMillis) VALUES (?, ?, 0, 0)", arrayOf(date, pkg))
                 }
-                db.usageDao().updateUsage(date, pkg, countAdd, timeAdd)
+                db.execSQL("UPDATE daily_usage SET reelCount = reelCount + ?, watchTimeMillis = watchTimeMillis + ? WHERE date = ? AND packageName = ?", arrayOf(countAdd, timeAdd, date, pkg))
             } catch (e: Exception) { 
                 e.printStackTrace() 
             }
@@ -176,7 +150,7 @@ class ReelAccessibilityService : AccessibilityService() {
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         serviceScope.launch(Dispatchers.IO) {
             try {
-                val db = GenZDatabase.getDatabase(applicationContext)
+                val db = GenZDatabase.getDatabase(applicationContext).openHelper.readableDatabase
                 val cursor = db.query("SELECT reelCount, watchTimeMillis FROM daily_usage WHERE date = ? AND packageName = ?", arrayOf(date, currentPackage))
                 if (cursor.moveToFirst()) {
                     currentReelCount = cursor.getInt(0)
