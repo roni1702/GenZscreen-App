@@ -3,8 +3,11 @@ package com.example.genzscreen.ui.screens
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -14,68 +17,100 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.example.genzscreen.data.GenZDatabase
+import com.example.genzscreen.ui.theme.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
+data class DayUsageData(
+    val dateString: String,
+    val displayLabel: String,
+    val fullDateLabel: String,
+    var totalReels: Int = 0,
+    var totalTimeMillis: Long = 0L,
+    val appStats: MutableMap<String, Pair<Int, Long>> = mutableMapOf() // AppName -> (Reels, TimeMillis)
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OverallDetailsScreen(navController: NavController) {
     var isReelsActive by remember { mutableStateOf(true) }
-    var weekOffset by remember { mutableStateOf(0) }
+    var weekOffset by remember { mutableStateOf(0) } // 0 = current week, -1 = last week
+    var selectedDayIndex by remember { mutableStateOf(6) } // Default: Today (last item)
 
-    var dailyCount by remember { mutableStateOf(0) }
-    var dailyTimeStr by remember { mutableStateOf("0 hr 0 min") }
-    var appRankingList by remember { mutableStateOf(emptyList<Pair<String, Int>>()) }
+    var weekDaysData by remember { mutableStateOf<List<DayUsageData>>(emptyList()) }
     val context = LocalContext.current
 
-    LaunchedEffect(isReelsActive, weekOffset) {
+    // ৭ দিনের তারিখ ও ডেটাবেজ থেকে রিয়েল ডেটা লোড
+    LaunchedEffect(weekOffset) {
         withContext(Dispatchers.IO) {
+            val dbFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+            val shortDayFormat = SimpleDateFormat("EEE\ndd", Locale.getDefault())
+            val fullLabelFormat = SimpleDateFormat("EEE, dd MMM", Locale.getDefault())
+
+            val cal = Calendar.getInstance()
+            cal.add(Calendar.DAY_OF_YEAR, weekOffset * 7)
+            cal.add(Calendar.DAY_OF_YEAR, -6) // ৭ দিনের উইন্ডোর শুরুতে যাওয়া
+
+            val daysList = mutableListOf<DayUsageData>()
+            for (i in 0..6) {
+                val dStr = dbFormat.format(cal.time)
+                val shortLbl = shortDayFormat.format(cal.time).lowercase()
+                val fullLbl = fullLabelFormat.format(cal.time).lowercase()
+                daysList.add(DayUsageData(dStr, shortLbl, fullLbl))
+                cal.add(Calendar.DAY_OF_YEAR, 1)
+            }
+
+            // ডেটাবেজ থেকে এই ৭ দিনের ডেটা আনা
             val db = GenZDatabase.getDatabase(context)
-            val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-            db.usageDao().getUsageForDate(date).collect { list ->
-                var totalCount = 0
-                var totalTime = 0L
-                val rankingMap = mutableMapOf<String, Int>()
+            val cursor = db.openHelper.readableDatabase.query(
+                "SELECT date, packageName, reelCount, watchTimeMillis FROM daily_usage WHERE date >= ? AND date <= ?",
+                arrayOf(daysList.first().dateString, daysList.last().dateString)
+            )
 
-                list.forEach { usage ->
-                    val appName = when(usage.packageName) {
-                        "com.facebook.katana" -> "Facebook"
-                        "com.google.android.youtube" -> "YouTube"
-                        "com.instagram.android" -> "Instagram"
-                        "com.zhiliaoapp.musically" -> "TikTok"
-                        else -> "Unknown"
-                    }
-                    totalCount += usage.reelCount
-                    totalTime += usage.watchTimeMillis
-                    
-                    val value = if (isReelsActive) usage.reelCount else (usage.watchTimeMillis / 60000).toInt()
-                    rankingMap[appName] = value
-                }
+            while (cursor.moveToNext()) {
+                val date = cursor.getString(0)
+                val pkg = cursor.getString(1)
+                val count = cursor.getInt(2)
+                val time = cursor.getLong(3)
 
-                val mins = (totalTime / 60000) % 60
-                val hrs = (totalTime / 3600000)
-                
-                withContext(Dispatchers.Main) {
-                    dailyCount = totalCount
-                    dailyTimeStr = if (hrs > 0) "$hrs hr $mins min" else "$mins min"
-                    appRankingList = rankingMap.toList().sortedByDescending { it.second }.filter { it.second > 0 }
+                val dayObj = daysList.find { it.dateString == date }
+                if (dayObj != null) {
+                    dayObj.totalReels += count
+                    dayObj.totalTimeMillis += time
+                    val appName = getAppNameFromPackage(pkg)
+                    dayObj.appStats[appName] = Pair(count, time)
                 }
+            }
+            cursor.close()
+
+            withContext(Dispatchers.Main) {
+                weekDaysData = daysList
+                selectedDayIndex = 6 // ডিফল্ট সিলেকশন আজকের দিন
             }
         }
     }
+
+    val selectedDay = weekDaysData.getOrNull(selectedDayIndex)
+    val selectedCount = selectedDay?.totalReels ?: 0
+    val selectedTimeMillis = selectedDay?.totalTimeMillis ?: 0L
+    val selectedHours = (selectedTimeMillis / 3600000)
+    val selectedMinutes = (selectedTimeMillis / 60000) % 60
+    val formattedTime = if (selectedHours > 0) "$selectedHours hr $selectedMinutes min" else "$selectedMinutes min"
 
     Scaffold(
         topBar = {
@@ -89,43 +124,162 @@ fun OverallDetailsScreen(navController: NavController) {
             )
         }
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
-            Row(modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp), horizontalArrangement = Arrangement.Center) {
-                SegmentedToggleButton(isActive = isReelsActive, leftText = "Reels & Video", rightText = "Time Watch", onToggle = { isReelsActive = it })
-            }
-
-            Text(
-                text = if (isReelsActive) "$dailyCount reels & video watch" else dailyTimeStr,
-                fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 8.dp)
-            )
-
-            Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { weekOffset-- }) { Icon(Icons.Default.KeyboardArrowLeft, contentDescription = "Previous") }
-                Text(text = if (weekOffset == 0) "Current Week" else "Previous Week", fontWeight = FontWeight.Medium)
-                if (weekOffset < 0) {
-                    IconButton(onClick = { weekOffset++ }) { Icon(Icons.Default.KeyboardArrowRight, contentDescription = "Next") }
-                } else { Spacer(modifier = Modifier.size(48.dp)) }
-            }
-
-            Card(modifier = Modifier.fillMaxWidth().height(200.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))) {
-                WeeklyBarChart(average = 0f, offset = weekOffset)
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-            Text("App Usage Ranking", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 16.dp)
+        ) {
             Spacer(modifier = Modifier.height(8.dp))
 
-            if (appRankingList.isEmpty()) {
-                Text("No usage recorded yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 16.dp))
+            // টগল বাটন: Reels & Video seen | Time watch
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                SegmentedToggleButton(
+                    isActive = isReelsActive,
+                    leftText = "Reels & Video",
+                    rightText = "Time Watch",
+                    onToggle = { isReelsActive = it }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // সামারি টেক্সট (সিলেক্ট করা দিনের তথ্য)
+            Column {
+                Text(
+                    text = if (isReelsActive) "$selectedCount reels & video watch" else formattedTime,
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+                Text(
+                    text = selectedDay?.fullDateLabel ?: "",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // নেভিগেশন অ্যারো (চলতি সপ্তাহে ডানদিকের অ্যারো লুকানো)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = { if (weekOffset > -26) weekOffset-- }) {
+                    Icon(Icons.Default.KeyboardArrowLeft, contentDescription = "Previous Week")
+                }
+
+                Text(
+                    text = if (weekOffset == 0) "Current Week" else "Week (${weekDaysData.firstOrNull()?.dateString ?: ""} to ${weekDaysData.lastOrNull()?.dateString ?: ""})",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                if (weekOffset < 0) {
+                    IconButton(onClick = { weekOffset++ }) {
+                        Icon(Icons.Default.KeyboardArrowRight, contentDescription = "Next Week")
+                    }
+                } else {
+                    Spacer(modifier = Modifier.size(48.dp))
+                }
+            }
+
+            // ৭ দিনের ইন্টারঅ্যাক্টিভ বার চার্ট
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(210.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                InteractiveWeeklyBarChart(
+                    weekDays = weekDaysData,
+                    selectedIndex = selectedDayIndex,
+                    isReels = isReelsActive,
+                    onBarClick = { clickedIndex -> selectedDayIndex = clickedIndex }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // অ্যাপ ইউসেজ র‍্যাংকিং তালিকা
+            Text(
+                text = "App Usage Ranking (${selectedDay?.fullDateLabel ?: ""})",
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            val currentDayAppStats = selectedDay?.appStats?.toList()?.sortedByDescending {
+                if (isReelsActive) it.second.first else it.second.second
+            }?.filter { it.second.first > 0 || it.second.second > 0 } ?: emptyList()
+
+            if (currentDayAppStats.isEmpty()) {
+                Text(
+                    text = "No reels or video watched on this day.",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 16.dp)
+                )
             } else {
-                LazyColumn {
-                    items(appRankingList.size) { index ->
-                        val item = appRankingList[index]
-                        Row(modifier = Modifier.fillMaxWidth().clickable { navController.navigate("app_details/${item.first}") }.padding(vertical = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(text = item.first, fontWeight = FontWeight.Medium)
-                            Text(text = "${item.second} ${if (isReelsActive) "reels" else "mins"}")
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(currentDayAppStats) { (appName, stats) ->
+                        val (reels, time) = stats
+                        val appMins = (time / 60000)
+                        val appColor = when (appName) {
+                            "Facebook" -> FacebookColor
+                            "YouTube" -> YouTubeColor
+                            "Instagram" -> InstagramColor
+                            "TikTok" -> TikTokColor
+                            else -> MaterialTheme.colorScheme.primary
                         }
-                        Divider(color = MaterialTheme.colorScheme.surfaceVariant)
+
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { navController.navigate("app_details/$appName") },
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                            shape = RoundedCornerShape(12.dp),
+                            border = CardDefaults.outlinedCardBorder()
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(12.dp)
+                                            .clip(CircleShape)
+                                            .background(appColor)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(appName, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                                }
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = "$reels reels",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "•  $appMins min",
+                                        fontSize = 13.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -133,24 +287,123 @@ fun OverallDetailsScreen(navController: NavController) {
     }
 }
 
+// ৭ দিনের ক্লিকযোগ্য ইন্টারঅ্যাক্টিভ বার চার্ট
 @Composable
-fun SegmentedToggleButton(isActive: Boolean, leftText: String, rightText: String, onToggle: (Boolean) -> Unit) {
-    Row(modifier = Modifier.background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(24.dp))) {
-        Button(onClick = { onToggle(true) }, colors = ButtonDefaults.buttonColors(containerColor = if (isActive) MaterialTheme.colorScheme.primary else Color.Transparent, contentColor = if (isActive) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant), elevation = ButtonDefaults.buttonElevation(0.dp), shape = RoundedCornerShape(topStart = 24.dp, bottomStart = 24.dp)) { Text(leftText) }
-        Button(onClick = { onToggle(false) }, colors = ButtonDefaults.buttonColors(containerColor = if (!isActive) MaterialTheme.colorScheme.primary else Color.Transparent, contentColor = if (!isActive) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant), elevation = ButtonDefaults.buttonElevation(0.dp), shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp)) { Text(rightText) }
+fun InteractiveWeeklyBarChart(
+    weekDays: List<DayUsageData>,
+    selectedIndex: Int,
+    isReels: Boolean,
+    onBarClick: (Int) -> Unit
+) {
+    if (weekDays.isEmpty()) return
+
+    val values = weekDays.map { if (isReels) it.totalReels.toFloat() else (it.totalTimeMillis / 60000).toFloat() }
+    val maxVal = (values.maxOrNull() ?: 10f).coerceAtLeast(10f)
+    val avgVal = values.average().toFloat()
+
+    val dashEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
+
+    Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .pointerInput(Unit) {
+                    detectTapGestures { offset ->
+                        val barWidth = size.width / 7f
+                        val clickedIndex = (offset.x / barWidth).toInt().coerceIn(0, 6)
+                        onBarClick(clickedIndex)
+                    }
+                }
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val width = size.width
+                val height = size.height
+                val barWidth = (width / 7f) * 0.45f
+
+                // উইকলি এভারেজ ডটেড লাইন
+                if (avgVal > 0) {
+                    val avgY = height - ((avgVal / maxVal) * height)
+                    drawLine(
+                        color = Color(0xFF64748B),
+                        start = Offset(0f, avgY),
+                        end = Offset(width, avgY),
+                        strokeWidth = 2f,
+                        pathEffect = dashEffect
+                    )
+                }
+
+                // ৭টি বার আঁকা
+                for (i in 0 until 7) {
+                    val slotCenter = (i * (width / 7f)) + ((width / 7f) / 2f)
+                    val barHeight = ((values[i] / maxVal) * (height - 20f)).coerceAtLeast(6f)
+                    val top = height - barHeight
+
+                    val isSelected = (i == selectedIndex)
+                    val barColor = if (isSelected) {
+                        Color(0xFF1A73E8) // সিলেক্ট করা বারের কালার উজ্জ্বল নীল
+                    } else {
+                        Color(0xFFCBD5E1) // বাকিগুলো সফট ধূসর
+                    }
+
+                    drawRoundRect(
+                        color = barColor,
+                        topLeft = Offset(slotCenter - (barWidth / 2f), top),
+                        size = Size(barWidth, barHeight),
+                        cornerRadius = CornerRadius(6.dp.toPx())
+                    )
+                }
+            }
+        }
+
+        // X-অ্যাক্সিস লেবেল (তারিখ ও বারের নাম)
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            horizontalArrangement = Arrangement.SpaceAround
+        ) {
+            weekDays.forEachIndexed { index, day ->
+                val isSelected = (index == selectedIndex)
+                Text(
+                    text = day.displayLabel,
+                    fontSize = 10.sp,
+                    lineHeight = 12.sp,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.clickable { onBarClick(index) }
+                )
+            }
+        }
     }
 }
 
 @Composable
-fun WeeklyBarChart(average: Float, offset: Int) {
-    val dashEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
-    Canvas(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        val width = size.width
-        val height = size.height
-        val barWidth = width / 14f
-        for (i in 0 until 7) {
-            val x = (i * 2 * barWidth) + barWidth / 2f
-            drawRoundRect(color = Color(0xFF1A73E8).copy(alpha = 0.2f), topLeft = Offset(x, height - 10f), size = Size(barWidth, 10f), cornerRadius = CornerRadius(4.dp.toPx()))
-        }
+fun SegmentedToggleButton(
+    isActive: Boolean,
+    leftText: String,
+    rightText: String,
+    onToggle: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(24.dp))
+    ) {
+        Button(
+            onClick = { onToggle(true) },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (isActive) MaterialTheme.colorScheme.primary else Color.Transparent,
+                contentColor = if (isActive) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+            ),
+            elevation = ButtonDefaults.buttonElevation(0.dp),
+            shape = RoundedCornerShape(topStart = 24.dp, bottomStart = 24.dp)
+        ) { Text(leftText, fontSize = 13.sp) }
+
+        Button(
+            onClick = { onToggle(false) },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (!isActive) MaterialTheme.colorScheme.primary else Color.Transparent,
+                contentColor = if (!isActive) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+            ),
+            elevation = ButtonDefaults.buttonElevation(0.dp),
+            shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp)
+        ) { Text(rightText, fontSize = 13.sp) }
     }
 }
