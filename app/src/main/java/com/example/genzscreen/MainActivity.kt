@@ -7,14 +7,15 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.text.TextUtils
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.runtime.Composable
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -23,11 +24,13 @@ import com.example.genzscreen.ui.screens.*
 import com.example.genzscreen.ui.theme.GenZscreenTheme
 
 class MainActivity : ComponentActivity() {
+
+    private var hasOverlayPermission by mutableStateOf(false)
+    private var hasAccessibilityPermission by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // অ্যাপ চালু হওয়ার সাথে সাথে পারমিশন চেক করবে
-        checkAndRequestPermissions()
+        updatePermissionStates()
 
         setContent {
             GenZscreenTheme {
@@ -35,6 +38,15 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
+                    // যদি কোনো পারমিশন বাকি থাকে, তবে প্রথমে সুন্দর এক্সপ্লেনেশন ডায়ালগ দেখাবে
+                    if (!hasOverlayPermission || !hasAccessibilityPermission) {
+                        PermissionExplanationDialog(
+                            missingOverlay = !hasOverlayPermission,
+                            missingAccessibility = !hasAccessibilityPermission,
+                            onGrantClick = { requestNextPermission() }
+                        )
+                    }
+
                     GenZAppNavigation()
                 }
             }
@@ -43,39 +55,34 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // ব্যবহারকারী সেটিং থেকে ফিরে আসলে আবার চেক করবে
-        checkAndRequestPermissions()
+        updatePermissionStates()
     }
 
-    private fun checkAndRequestPermissions() {
-        // ১. ওভারলে (Display over other apps) পারমিশন চেক
-        if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "Please allow 'Display over other apps' permission", Toast.LENGTH_LONG).show()
+    private fun updatePermissionStates() {
+        hasOverlayPermission = Settings.canDrawOverlays(this)
+        hasAccessibilityPermission = isAccessibilityServiceEnabled(this, ReelAccessibilityService::class.java)
+    }
+
+    private fun requestNextPermission() {
+        if (!hasOverlayPermission) {
             val intent = Intent(
                 Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                 Uri.parse("package:$packageName")
             )
             startActivity(intent)
-            return
-        }
-
-        // ২. অ্যাক্সেসিবিলিটি (Accessibility) পারমিশন চেক
-        if (!isAccessibilityServiceEnabled(this, ReelAccessibilityService::class.java)) {
-            Toast.makeText(this, "Please enable 'GenZscreen' Accessibility Service", Toast.LENGTH_LONG).show()
+        } else if (!hasAccessibilityPermission) {
             val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
             startActivity(intent)
-            return
         }
     }
 
-    // অ্যাক্সেসিবিলিটি চালু আছে কিনা চেক করার লজিক
     private fun isAccessibilityServiceEnabled(context: Context, service: Class<*>): Boolean {
         val expectedComponentName = ComponentName(context, service)
         val enabledServicesSetting = Settings.Secure.getString(
             context.contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        )
-        if (enabledServicesSetting == null) return false
+        ) ?: return false
+
         val colonSplitter = TextUtils.SimpleStringSplitter(':')
         colonSplitter.setString(enabledServicesSetting)
         while (colonSplitter.hasNext()) {
@@ -87,6 +94,77 @@ class MainActivity : ComponentActivity() {
         }
         return false
     }
+}
+
+// ডিজিটাল ওয়েলবিং স্টাইলের পারমিশন এক্সপ্লেনেশন ডায়ালগ
+@Composable
+fun PermissionExplanationDialog(
+    missingOverlay: Boolean,
+    missingAccessibility: Boolean,
+    onGrantClick: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = { /* বাধ্যতামূলক পারমিশন */ },
+        title = {
+            Text(
+                text = "Permissions Required",
+                fontWeight = FontWeight.Bold,
+                fontSize = 20.sp
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    text = "GenZscreen needs the following permissions to help you control your reels and video addiction:",
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                if (missingOverlay) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = "1. Display Over Other Apps",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                            Text(
+                                text = "Required to show the floating counter box on top of reels so you can track your time.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                if (missingAccessibility) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = "2. Accessibility Service",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                            Text(
+                                text = "Required to detect when a reel starts playing in Facebook, YouTube, TikTok, or Instagram and enforce your limits.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onGrantClick) {
+                Text("Grant Permission")
+            }
+        }
+    )
 }
 
 @Composable
