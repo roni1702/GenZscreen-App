@@ -49,6 +49,47 @@ data class AppSpecificDayData(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppSpecificScreen(navController: NavController, appName: String) {
+    // কেস-ইনসেন্সিটিভ প্যাকেজ নেম রেজল্যুশন
+    val packageName = remember(appName) {
+        when (appName.trim().lowercase(Locale.getDefault())) {
+            "facebook" -> "com.facebook.katana"
+            "youtube" -> "com.google.android.youtube"
+            "instagram" -> "com.instagram.android"
+            "tiktok" -> "com.zhiliaoapp.musically"
+            else -> ""
+        }
+    }
+
+    // ১. গার্ড: প্যাকেজ নেম ফাঁকা হলে কুয়েরি চালাবে না
+    if (packageName.isBlank()) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("App Details", fontWeight = FontWeight.Bold) },
+                    navigationIcon = {
+                        IconButton(onClick = { navController.popBackStack() }) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        }
+                    }
+                )
+            }
+        ) { padding ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "Unsupported or invalid app: $appName",
+                    color = MaterialTheme.colorScheme.error,
+                    fontSize = 16.sp
+                )
+            }
+        }
+        return
+    }
+
     var isReelsActive by remember { mutableStateOf(true) }
     var weekOffset by remember { mutableStateOf(0) }
     var selectedDayIndex by remember { mutableStateOf(6) }
@@ -62,14 +103,7 @@ fun AppSpecificScreen(navController: NavController, appName: String) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
-    val packageName = when (appName) {
-        "Facebook" -> "com.facebook.katana"
-        "YouTube" -> "com.google.android.youtube"
-        "Instagram" -> "com.instagram.android"
-        "TikTok" -> "com.zhiliaoapp.musically"
-        else -> ""
-    }
-
+    // ডেটাবেজ থেকে এই অ্যাপের সক্রিয় লিমিট লোড
     LaunchedEffect(packageName) {
         withContext(Dispatchers.IO) {
             val db = GenZDatabase.getDatabase(context)
@@ -81,6 +115,7 @@ fun AppSpecificScreen(navController: NavController, appName: String) {
         }
     }
 
+    // নির্দিষ্ট অ্যাপের ফিল্টার করা ৭ দিনের ডেটা লোড
     LaunchedEffect(weekOffset, packageName) {
         withContext(Dispatchers.IO) {
             val dbFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
@@ -282,9 +317,15 @@ fun AppSpecificScreen(navController: NavController, appName: String) {
             }
         }
 
+        // লিমিট সেট ডায়ালগ (সম্পূর্ণ ইনপুট ভ্যালিডেশনযুক্ত)
         if (showLimitDialog) {
             var countInput by remember { mutableStateOf(activeCountLimit?.toString() ?: "") }
             var timeInput by remember { mutableStateOf(activeTimeLimit?.toString() ?: "") }
+
+            // ভ্যালিডেশন: কমপক্ষে যেকোনো একটিতে ১ বা তার বেশি পূর্ণসংখ্যা থাকতে হবে
+            val parsedCount = countInput.trim().toIntOrNull()?.takeIf { it > 0 }
+            val parsedTime = timeInput.trim().toIntOrNull()?.takeIf { it > 0 }
+            val isInputValid = (parsedCount != null || parsedTime != null)
 
             AlertDialog(
                 onDismissRequest = { showLimitDialog = false },
@@ -292,13 +333,13 @@ fun AppSpecificScreen(navController: NavController, appName: String) {
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text(
-                            text = "Set limit for reel count, watch time, or both:",
+                            text = "Set limit for reel count, watch time, or both (at least one required):",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         OutlinedTextField(
                             value = countInput,
-                            onValueChange = { countInput = it },
+                            onValueChange = { countInput = it.filter { char -> char.isDigit() } },
                             label = { Text("Reels Count Limit") },
                             placeholder = { Text("e.g. 30") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -307,7 +348,7 @@ fun AppSpecificScreen(navController: NavController, appName: String) {
                         )
                         OutlinedTextField(
                             value = timeInput,
-                            onValueChange = { timeInput = it },
+                            onValueChange = { timeInput = it.filter { char -> char.isDigit() } },
                             label = { Text("Time Limit (Minutes)") },
                             placeholder = { Text("e.g. 45") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -317,20 +358,24 @@ fun AppSpecificScreen(navController: NavController, appName: String) {
                     }
                 },
                 confirmButton = {
-                    Button(onClick = {
-                        val count = countInput.toIntOrNull()
-                        val time = timeInput.toIntOrNull()
-                        activeCountLimit = count
-                        activeTimeLimit = time
-                        showLimitDialog = false
+                    Button(
+                        onClick = {
+                            if (isInputValid) {
+                                activeCountLimit = parsedCount
+                                activeTimeLimit = parsedTime
+                                showLimitDialog = false
 
-                        coroutineScope.launch(Dispatchers.IO) {
-                            val timeMillis = time?.let { it * 60000L }
-                            GenZDatabase.getDatabase(context).usageDao().insertLimit(
-                                AppLimit(packageName, count, timeMillis)
-                            )
-                        }
-                    }) {
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    val timeMillis = parsedTime?.let { it * 60000L }
+                                    GenZDatabase.getDatabase(context).usageDao().insertLimit(
+                                        AppLimit(packageName, parsedCount, timeMillis)
+                                    )
+                                }
+                            }
+                        },
+                        // অন্তত একটি ভ্যালিড সংখ্যা না দেওয়া পর্যন্ত বাটন ডিজেবল থাকবে
+                        enabled = isInputValid
+                    ) {
                         Text("Save Limit")
                     }
                 },
