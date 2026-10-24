@@ -210,8 +210,8 @@ fun OverallDetailsScreen(navController: NavController) {
             Spacer(modifier = Modifier.height(8.dp))
 
             val currentDayAppStats = selectedDay?.appStats?.toList()?.sortedByDescending {
-                if (isReelsActive) it.second.first else it.second.second
-            }?.filter { it.second.first > 0 || it.second.second > 0 } ?: emptyList()
+                if (isReelsActive) it.second.first.toLong() else it.second.second
+            }?.filter { it.second.first > 0 || it.second.second > 0L } ?: emptyList()
 
             if (currentDayAppStats.isEmpty()) {
                 Text(
