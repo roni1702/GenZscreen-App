@@ -15,6 +15,8 @@ import androidx.compose.material.icons.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -36,26 +38,25 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
-data class DayUsageData(
+data class OverallDayData(
     val dateString: String,
     val displayLabel: String,
     val fullDateLabel: String,
     var totalReels: Int = 0,
     var totalTimeMillis: Long = 0L,
-    val appStats: MutableMap<String, Pair<Int, Long>> = mutableMapOf() // AppName -> (Reels, TimeMillis)
+    val appStats: MutableMap<String, Pair<Int, Long>> = mutableMapOf()
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OverallDetailsScreen(navController: NavController) {
     var isReelsActive by remember { mutableStateOf(true) }
-    var weekOffset by remember { mutableStateOf(0) } // 0 = current week, -1 = last week
-    var selectedDayIndex by remember { mutableStateOf(6) } // Default: Today (last item)
+    var weekOffset by remember { mutableStateOf(0) }
+    var selectedDayIndex by remember { mutableStateOf(6) }
 
-    var weekDaysData by remember { mutableStateOf<List<DayUsageData>>(emptyList()) }
+    var weekDaysData by remember { mutableStateOf<List<OverallDayData>>(emptyList()) }
     val context = LocalContext.current
 
-    // ৭ দিনের তারিখ ও ডেটাবেজ থেকে রিয়েল ডেটা লোড
     LaunchedEffect(weekOffset) {
         withContext(Dispatchers.IO) {
             val dbFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
@@ -64,18 +65,17 @@ fun OverallDetailsScreen(navController: NavController) {
 
             val cal = Calendar.getInstance()
             cal.add(Calendar.DAY_OF_YEAR, weekOffset * 7)
-            cal.add(Calendar.DAY_OF_YEAR, -6) // ৭ দিনের উইন্ডোর শুরুতে যাওয়া
+            cal.add(Calendar.DAY_OF_YEAR, -6)
 
-            val daysList = mutableListOf<DayUsageData>()
+            val daysList = mutableListOf<OverallDayData>()
             for (i in 0..6) {
                 val dStr = dbFormat.format(cal.time)
                 val shortLbl = shortDayFormat.format(cal.time).lowercase()
                 val fullLbl = fullLabelFormat.format(cal.time).lowercase()
-                daysList.add(DayUsageData(dStr, shortLbl, fullLbl))
+                daysList.add(OverallDayData(dStr, shortLbl, fullLbl))
                 cal.add(Calendar.DAY_OF_YEAR, 1)
             }
 
-            // ডেটাবেজ থেকে এই ৭ দিনের ডেটা আনা
             val db = GenZDatabase.getDatabase(context)
             val cursor = db.openHelper.readableDatabase.query(
                 "SELECT date, packageName, reelCount, watchTimeMillis FROM daily_usage WHERE date >= ? AND date <= ?",
@@ -92,7 +92,7 @@ fun OverallDetailsScreen(navController: NavController) {
                 if (dayObj != null) {
                     dayObj.totalReels += count
                     dayObj.totalTimeMillis += time
-                    val appName = getAppNameFromPackage(pkg)
+                    val appName = getAppNameInternal(pkg)
                     dayObj.appStats[appName] = Pair(count, time)
                 }
             }
@@ -100,7 +100,7 @@ fun OverallDetailsScreen(navController: NavController) {
 
             withContext(Dispatchers.Main) {
                 weekDaysData = daysList
-                selectedDayIndex = 6 // ডিফল্ট সিলেকশন আজকের দিন
+                selectedDayIndex = 6
             }
         }
     }
@@ -132,9 +132,8 @@ fun OverallDetailsScreen(navController: NavController) {
         ) {
             Spacer(modifier = Modifier.height(8.dp))
 
-            // টগল বাটন: Reels & Video seen | Time watch
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                SegmentedToggleButton(
+                OverallSegmentedToggle(
                     isActive = isReelsActive,
                     leftText = "Reels & Video",
                     rightText = "Time Watch",
@@ -144,7 +143,6 @@ fun OverallDetailsScreen(navController: NavController) {
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // সামারি টেক্সট (সিলেক্ট করা দিনের তথ্য)
             Column {
                 Text(
                     text = if (isReelsActive) "$selectedCount reels & video watch" else formattedTime,
@@ -162,7 +160,6 @@ fun OverallDetailsScreen(navController: NavController) {
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // নেভিগেশন অ্যারো (চলতি সপ্তাহে ডানদিকের অ্যারো লুকানো)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -188,7 +185,6 @@ fun OverallDetailsScreen(navController: NavController) {
                 }
             }
 
-            // ৭ দিনের ইন্টারঅ্যাক্টিভ বার চার্ট
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -196,7 +192,7 @@ fun OverallDetailsScreen(navController: NavController) {
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
                 shape = RoundedCornerShape(16.dp)
             ) {
-                InteractiveWeeklyBarChart(
+                OverallBarChartCanvas(
                     weekDays = weekDaysData,
                     selectedIndex = selectedDayIndex,
                     isReels = isReelsActive,
@@ -206,7 +202,6 @@ fun OverallDetailsScreen(navController: NavController) {
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // অ্যাপ ইউসেজ র‍্যাংকিং তালিকা
             Text(
                 text = "App Usage Ranking (${selectedDay?.fullDateLabel ?: ""})",
                 fontWeight = FontWeight.Bold,
@@ -287,10 +282,9 @@ fun OverallDetailsScreen(navController: NavController) {
     }
 }
 
-// ৭ দিনের ক্লিকযোগ্য ইন্টারঅ্যাক্টিভ বার চার্ট
 @Composable
-fun InteractiveWeeklyBarChart(
-    weekDays: List<DayUsageData>,
+fun OverallBarChartCanvas(
+    weekDays: List<OverallDayData>,
     selectedIndex: Int,
     isReels: Boolean,
     onBarClick: (Int) -> Unit
@@ -321,7 +315,6 @@ fun InteractiveWeeklyBarChart(
                 val height = size.height
                 val barWidth = (width / 7f) * 0.45f
 
-                // উইকলি এভারেজ ডটেড লাইন
                 if (avgVal > 0) {
                     val avgY = height - ((avgVal / maxVal) * height)
                     drawLine(
@@ -333,18 +326,13 @@ fun InteractiveWeeklyBarChart(
                     )
                 }
 
-                // ৭টি বার আঁকা
                 for (i in 0 until 7) {
                     val slotCenter = (i * (width / 7f)) + ((width / 7f) / 2f)
                     val barHeight = ((values[i] / maxVal) * (height - 20f)).coerceAtLeast(6f)
                     val top = height - barHeight
 
                     val isSelected = (i == selectedIndex)
-                    val barColor = if (isSelected) {
-                        Color(0xFF1A73E8) // সিলেক্ট করা বারের কালার উজ্জ্বল নীল
-                    } else {
-                        Color(0xFFCBD5E1) // বাকিগুলো সফট ধূসর
-                    }
+                    val barColor = if (isSelected) Color(0xFF1A73E8) else Color(0xFFCBD5E1)
 
                     drawRoundRect(
                         color = barColor,
@@ -356,7 +344,6 @@ fun InteractiveWeeklyBarChart(
             }
         }
 
-        // X-অ্যাক্সিস লেবেল (তারিখ ও বারের নাম)
         Row(
             modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
             horizontalArrangement = Arrangement.SpaceAround
@@ -377,7 +364,7 @@ fun InteractiveWeeklyBarChart(
 }
 
 @Composable
-fun SegmentedToggleButton(
+fun OverallSegmentedToggle(
     isActive: Boolean,
     leftText: String,
     rightText: String,
@@ -405,5 +392,15 @@ fun SegmentedToggleButton(
             elevation = ButtonDefaults.buttonElevation(0.dp),
             shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp)
         ) { Text(rightText, fontSize = 13.sp) }
+    }
+}
+
+private fun getAppNameInternal(pkg: String): String {
+    return when (pkg) {
+        "com.facebook.katana" -> "Facebook"
+        "com.google.android.youtube" -> "YouTube"
+        "com.instagram.android" -> "Instagram"
+        "com.zhiliaoapp.musically" -> "TikTok"
+        else -> "App"
     }
 }
